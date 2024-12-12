@@ -16,12 +16,39 @@ from tldr import get_paper_tldr
 from llama_cpp import Llama
 from tqdm import tqdm, trange
 from loguru import logger
+from openai import OpenAI
+from gitignore_parser import parse_gitignore
+from tempfile import mkstemp
 
 def get_zotero_corpus(id: str, key: str) -> list[dict]:
     zot = zotero.Zotero(id, 'user', key)
+    collections = {c['key']: c for c in zot.collections()}
     corpus = zot.everything(zot.items(itemType='conferencePaper || journalArticle || preprint'))
     corpus = [c for c in corpus if c['data']['abstractNote'] != '']
+
+    def get_collection_path(col_key: str) -> str:
+        if p := collections[col_key]['data'].get('parentCollection'):
+            return get_collection_path(p) + ' / ' + collections[col_key]['data']['name']
+        else:
+            return collections[col_key]['data']['name']
+
+    for c in corpus:
+        paths = [get_collection_path(col) for col in c['data']['collections']]
+        c['paths'] = paths
     return corpus
+
+def filter_corpus(corpus: list[dict], pattern: str) -> list[dict]:
+    _, filename = mkstemp()
+    with open(filename, 'w') as file:
+        file.write(pattern)
+    matcher = parse_gitignore(filename, base_dir='./')
+    new_corpus = []
+    for c in corpus:
+        match_results = [matcher(p) for p in c['paths']]
+        if not any(match_results):
+            new_corpus.append(c)
+    os.remove(filename)
+    return new_corpus
 
 def get_paper_code_url(paper: arxiv.Result) -> str:
     retry_num = 5
@@ -211,6 +238,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Recommender system for academic papers')
     parser.add_argument('--zotero_id', type=str, help='Zotero user ID', default=os.environ.get('ZOTERO_ID'))
     parser.add_argument('--zotero_key', type=str, help='Zotero API key', default=os.environ.get('ZOTERO_KEY'))
+    parser.add_argument('--zotero_ignore', type=str, help='Zotero collection to ignore, using gitignore-style pattern.', default=os.environ.get('ZOTERO_IGNORE'))
     parser.add_argument('--max_paper_num', type=int, help='Maximum number of papers to recommend', default=int(os.environ.get('MAX_PAPER_NUM', 100)))
     parser.add_argument('--arxiv_query', type=str, help='Arxiv search query', default=os.environ.get('ARXIV_QUERY'))
     parser.add_argument('--smtp_server', type=str, help='SMTP server', default=os.environ.get('SMTP_SERVER'))
@@ -218,6 +246,30 @@ if __name__ == '__main__':
     parser.add_argument('--sender', type=str, help='Sender email address', default=os.environ.get('SENDER'))
     parser.add_argument('--receiver', type=str, help='Receiver email address', default=os.environ.get('RECEIVER'))
     parser.add_argument('--password', type=str, help='Sender email password', default=os.environ.get('SENDER_PASSWORD'))
+    parser.add_argument(
+        "--use_llm_api",
+        type=bool,
+        help="Use OpenAI API to generate TLDR",
+        default=os.environ.get("USE_LLM_API", False),
+    )
+    parser.add_argument(
+        "--openai_api_key",
+        type=str,
+        help="OpenAI API key",
+        default=os.environ.get("OPENAI_API_KEY"),
+    )
+    parser.add_argument(
+        "--openai_api_base",
+        type=str,
+        help="OpenAI API base URL",
+        default=os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        help="LLM Model Name",
+        default=os.environ.get("MODEL_NAME", "gpt-4o"),
+    )
     parser.add_argument('--debug', action='store_true', help='Debug mode')
     args = parser.parse_args()
 
@@ -230,6 +282,9 @@ if __name__ == '__main__':
     assert args.sender is not None, "Sender email address is required."
     assert args.receiver is not None, "Receiver email address is required."
     assert args.password is not None, "Sender email password is required."
+    assert (
+        not args.use_llm_api or args.openai_api_key is not None
+    ), "If use_llm_api is True, openai_api_key must be provided."
 
     if args.debug:
         logger.debug("Debug mode is on.")
@@ -240,6 +295,11 @@ if __name__ == '__main__':
     logger.info("Retrieving Zotero corpus...")
     corpus = get_zotero_corpus(args.zotero_id, args.zotero_key)
     logger.info(f"Retrieved {len(corpus)} papers from Zotero.")
+
+    if args.zotero_ignore:
+        logger.info(f"Ignoring papers in:\n {args.zotero_ignore}...")
+        corpus = filter_corpus(corpus, args.zotero_ignore)
+        logger.info(f"Remaining {len(corpus)} papers after filtering.")
 
     logger.info("Retrieving Arxiv papers...")
     papers = get_arxiv_paper(args.arxiv_query, yesterday, today, args.debug)
@@ -255,15 +315,25 @@ if __name__ == '__main__':
         papers = papers[:args.max_paper_num]
 
     logger.info("Generating TLDRs...")
-    llm = Llama.from_pretrained(
-        repo_id="Qwen/Qwen2.5-3B-Instruct-GGUF",
-        filename="qwen2.5-3b-instruct-q4_k_m.gguf",
-        n_ctx=4096,
-        n_threads=4,
-        verbose=False
-    )
-    for p in tqdm(papers, desc="Generating TLDRs"):
-        p.tldr = get_paper_tldr(p, llm)
+    if args.use_llm_api:
+        logger.info("Using OpenAI API to generate TLDRs...")
+        llm = OpenAI(
+            api_key=args.openai_api_key,
+            base_url=args.openai_api_base,
+        )
+        for p in tqdm(papers, desc="Generating TLDRs"):
+            p.tldr = get_paper_tldr(p, llm, model_name=args.model_name)
+    else:
+        logger.info("Using Local LLM model to generate TLDRs...")
+        llm = Llama.from_pretrained(
+            repo_id="Qwen/Qwen2.5-3B-Instruct-GGUF",
+            filename="qwen2.5-3b-instruct-q4_k_m.gguf",
+            n_ctx=4096,
+            n_threads=4,
+            verbose=False
+        )
+        for p in tqdm(papers, desc="Generating TLDRs"):
+            p.tldr = get_paper_tldr(p, llm)
 
     html = render_email(papers)
     logger.info("Sending email...")
